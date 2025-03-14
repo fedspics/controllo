@@ -1,0 +1,238 @@
+import cv2
+import os
+import matplotlib.pyplot as plt
+import numpy as np
+import random
+from collections import defaultdict
+
+def video_list(path):
+    return [folder for folder in os.listdir(path) if folder.endswith('.mp4')]
+
+
+# Function to calculate the number of frames per video and display the graph
+def frames_per_video(path, animals_counts):
+    videos = video_list(path)
+    dict_video = {}  # dictionary to count frames
+    videos_by_class = defaultdict(list)  # dictionary to associate videos to their classes
+    
+    print("----------------------------------------------------")
+    print(f"Number of frames per video:")
+    print(f"          ")
+    
+    for v in videos:
+        for animal in animals_counts:  # animals_counts è un dizionario con le classi
+            if animal in v:
+                video_path = os.path.join(path, v)
+                cap = cv2.VideoCapture(video_path)
+                frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                dict_video[v] = frames
+                videos_by_class[animal].append(v)
+                print(f'Video: {v} - - #frames: {frames}')
+    
+    classi_ordinate = sorted(videos_by_class.keys())
+    video_ordinati = []
+    sorted_frame_counts = []
+    
+    for animal in classi_ordinate:
+        for video in videos_by_class[animal]:
+            video_ordinati.append(video)
+            sorted_frame_counts.append(dict_video[video])
+    
+    plt.figure(figsize=(12, 6))
+    plt.bar(video_ordinati, sorted_frame_counts, color='darkgreen')  # Grafico orizzontale
+    plt.xlabel('Video')
+    plt.ylabel('# of frames')
+    plt.xticks(rotation=90, ha='right')
+    plt.tight_layout()
+    plt.show()
+
+    frames_valori = np.array(list(dict_video.values()))
+    media = np.mean(frames_valori)
+    mediana = np.median(frames_valori)
+    deviazione_standard = np.std(frames_valori)
+    
+    print("----------------------------------------------------")
+    print(f"Mean: {media:.2f}")
+    print(f"Median: {mediana:.2f}")
+    print(f"Standard Deviation: {deviazione_standard:.2f}")
+    print("----------------------------------------------------")
+
+
+
+# Function that allows you to calculate and display the number of videos for each category
+def count_videos_cat(path, animals_counts):
+    print(f"Number of video per category:")
+    print(f"          ")
+    
+    for file_animali in os.listdir(path):
+        for animal in animals_counts:
+            if animal in file_animali:
+                animals_counts[animal] += 1
+
+    for animal, count in animals_counts.items():
+        print(f'{animal} files:', count)
+
+    plt.figure(figsize=(12, 6))
+    plt.bar(animals_counts.keys(), animals_counts.values(), color='darkgreen')
+    plt.xlabel('Videos')
+    plt.ylabel('Animals')
+    plt.xticks(rotation=90, ha='right')
+    plt.tight_layout()
+    plt.show()
+
+    frames_valori = np.array(list(animals_counts.values()))
+    media = np.mean(frames_valori)
+    mediana = np.median(frames_valori)
+    deviazione_standard = np.std(frames_valori)
+    
+    print("----------------------------------------------------")
+    print(f"Mean: {media:.2f}")
+    print(f"Median: {mediana:.2f}")
+    print(f"Standard Deviation: {deviazione_standard:.2f}")
+    print("----------------------------------------------------")
+
+
+# Function that calculates the number of detections per video
+def count_detections(folder_path):
+    print(f"Number of detections per video:")
+    print(f"          ")
+    
+    total_lines = 0
+    for filename in os.listdir(folder_path):
+        file_path = os.path.join(folder_path, filename)
+        if os.path.isfile(file_path) and filename.endswith('.txt'):
+            with open(file_path, 'r') as fp:
+                line_count = sum(1 for _ in fp)
+                print(f'{filename}: {line_count} detections')
+                total_lines += line_count
+
+    return total_lines
+
+
+# Load bounding bb from file
+def load_bb(file_path):
+    bb = []
+    with open(file_path, 'r') as f:
+        for line in f:
+            data = line.strip().split(',')
+            bb.append({
+                'frame_id': int(data[0]),
+                'target_id': int(data[1]),
+                'x': int(data[2]),
+                'y': int(data[3]),
+                'width': int(data[4]),
+                'height': int(data[5]),
+                'confidence': float(data[6]),
+                'class': data[7],
+                'visibility': data[8]
+            })
+    return bb
+
+
+# Function to draw bounding box on the frame
+def draw_bb(frame, bb, target_frame):
+    found_bb = False
+    for box in bb:
+        if box['frame_id'] == target_frame:
+            x, y, w, h = box['x'], box['y'], box['width'], box['height']
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            found_bb = True
+    if not found_bb:
+        print(f"No bounding box found for frame{target_frame}.")
+    return frame
+
+
+# You get the first frame with bounding box
+def first_frame_bb(video_path, gt_path):
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"Error opening video: {video_path}")
+        return None, None
+    
+    ret, frame = cap.read()
+    if not ret:
+        print(f"Error loading first frame: {video_path}")
+        return None, None
+    
+    bb = load_bb(gt_path)
+    frame_with_bb = draw_bb(frame, bb, target_frame=1)
+    
+    cap.release()
+    return frame_with_bb, os.path.basename(video_path)
+
+
+# Calculate the resolution of each video and the number of frames for each resolution
+def tot_resolutions(path):
+    videos = video_list(path)
+    resolutions_count = defaultdict(lambda: {'video_count': 0, 'total_frames': 0})
+    
+   
+    print(f"----------------------------------------------------")
+    print(f"Total number of videos and frames per resolution:")
+    print(f"          ")
+    
+    for v in videos:
+        video_path = os.path.join(path, v)
+        cap = cv2.VideoCapture(video_path)
+        
+        if not cap.isOpened():
+            print(f"Error opening video: {video_path}")
+            continue
+
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        resolution = (width, height)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        resolutions_count[resolution]['video_count'] += 1
+        resolutions_count[resolution]['total_frames'] += total_frames
+    
+    for resolution, data in resolutions_count.items():
+        print(f"{resolution[0]}x{resolution[1]}: {data['video_count']} videos, {data['total_frames']} total frames")
+
+
+def main():
+    path = r'/Users/federicapiccardi/Downloads/Whole_AnimalTrack/videos_all'
+    gt_folder = r'/Users/federicapiccardi/Downloads/Whole_AnimalTrack/gt_all'
+    
+   
+    
+    animals_counts = {
+        'chicken': 0,
+        'deer': 0,
+        'dolphin': 0,
+        'pig': 0,
+        'rabbit': 0,
+        'zebra': 0,
+        'penguin': 0,
+        'horse': 0,
+        'goose': 0,
+        'duck': 0
+    }
+    frames_per_video(path, animals_counts)
+    count_videos_cat(path, animals_counts)
+    
+    count_detections(gt_folder)
+    
+    
+    # Carica i primi frame con bounding bb per ogni video
+    videos = [v for v in os.listdir(path) if v.endswith('.mp4')]
+    for video in videos:
+        video_path = os.path.join(path, video)
+        gt_path = os.path.join(gt_folder, video.replace('.mp4', '_gt.txt'))
+        
+        if os.path.exists(gt_path):
+            frame, name = first_frame_bb(video_path, gt_path)
+            if frame is not None:
+                plt.figure(figsize=(8, 6))
+                plt.imshow(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                plt.title(name)
+                plt.axis("off")
+                plt.show()
+        else:
+            print(f"Annotation file missing for {video}")
+
+    tot_resolutions(path)
+
+
+if __name__ == "__main__":
+    main()
