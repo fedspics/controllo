@@ -1,0 +1,212 @@
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import Image
+from geometry_msgs.msg import PoseStamped, Quaternion
+from cv_bridge import CvBridge
+from ultralytics import YOLO
+import tf2_ros
+from transformations.transformations import quaternion_from_euler
+import math
+import time
+import random
+import numpy as np
+from nav2_simple_commander.robot_navigator import BasicNavigator
+
+class PoseDetectionNode(Node):
+    def __init__(self):
+        super().__init__('pose_detection_node')
+
+        self.navigator = BasicNavigator()
+        self.get_logger().info('Esperando a que Nav2 esté activo...')
+        self.navigator.waitUntilNav2Active()
+        self.get_logger().info('¡Nav2 está listo!')
+
+        self.subscription = self.create_subscription(
+            Image,
+            '/head_front_camera/rgb/image_raw',
+            self.image_callback,
+            10)
+
+        self.bridge = CvBridge()
+        self.model = YOLO('yolov8n-pose.pt')
+
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
+        self.moving = False
+        self.alert_sent = False
+        self.latest_image_msg = None
+
+        self.no_detection_frames = 0
+        self.no_detection_threshold = 5
+        self.searching = False
+
+    def image_callback(self, msg):
+        if self.moving:
+            return
+
+        self.latest_image_msg = msg
+        cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        results = self.model(cv_image)
+
+        if not results or len(results[0].keypoints) == 0:
+            self.no_detection_frames += 1
+            self.get_logger().info(f"No se detectó ninguna persona. Fotogramas consecutivos sin persona: {self.no_detection_frames}")
+            if self.no_detection_frames >= self.no_detection_threshold and not self.searching:
+                self.get_logger().warn("Persona perdida, iniciando búsqueda automática.")
+                self.searching = True
+                self.start_search()
+            return
+        else:
+            self.no_detection_frames = 0
+            if self.searching:
+                self.get_logger().info("Persona encontrada, deteniendo búsqueda.")
+            self.searching = False
+
+            keypoints = results[0].keypoints[0].cpu().numpy()
+
+            head_indices = [0, 1, 2]
+            foot_indices = [15, 16]
+            head_visible = any(keypoints[i][2] > 0.3 for i in head_indices)
+            feet_visible = any(keypoints[i][2] > 0.3 for i in foot_indices)
+
+            if not (head_visible and feet_visible):
+                self.get_logger().info("Puntos clave de cabeza o pies no suficientemente visibles.")
+                return
+
+            fallen = self.check_fall(keypoints)
+
+            if fallen and not self.alert_sent:
+                self.alert_sent = True
+                self.get_logger().warn("¡Caída detectada! Enviando alerta.")
+                # Inserta aquí notificaciones o acciones adicionales
+            elif not fallen and self.alert_sent:
+                self.alert_sent = False
+                self.get_logger().info("La persona se ha levantado, reseteando alerta.")
+
+    def check_fall(self, keypoints):
+        head_indices = [0, 1, 2]
+        foot_indices = [15, 16]
+
+        head_points = [keypoints[i][:2] for i in head_indices if keypoints[i][2] > 0.3]
+        foot_points = [keypoints[i][:2] for i in foot_indices if keypoints[i][2] > 0.3]
+
+        if len(head_points) == 0 or len(foot_points) == 0:
+            return False
+
+        head_center = np.mean(head_points, axis=0) if len(head_points) > 1 else np.array(head_points[0])
+        foot_center = np.mean(foot_points, axis=0) if len(foot_points) > 1 else np.array(foot_points[0])
+
+        dist = np.linalg.norm(head_center - foot_center)
+
+        soglia_caduta = 100  # calibra según la resolución de la imagen
+
+        return dist < soglia_caduta
+
+    def get_robot_pose(self):
+        try:
+            now = rclpy.time.Time()
+            transform = self.tf_buffer.lookup_transform('map', 'base_link', now, timeout=rclpy.duration.Duration(seconds=1.0))
+            return transform.transform.translation
+        except Exception as e:
+            self.get_logger().warn(f"Error al recuperar transformación: {e}")
+            return None
+
+    def move_to(self, x, y, yaw=0.0):
+        goal = PoseStamped()
+        goal.header.frame_id = 'map'
+        goal.header.stamp = self.get_clock().now().to_msg()
+        goal.pose.position.x = float(x)
+        goal.pose.position.y = float(y)
+        q = quaternion_from_euler(0, 0, yaw)
+        goal.pose.orientation = Quaternion(x=q[0], y=q[1], z=q[2], w=q[3])
+
+        self.moving = True
+        self.get_logger().info(f"Navegando a: {x:.2f}, {y:.2f} con yaw {yaw:.2f} rad")
+        self.navigator.goToPose(goal)
+
+        start_time = time.time()
+        while not self.navigator.isTaskComplete():
+            if time.time() - start_time > 30:
+                self.get_logger().error("Tiempo de espera agotado durante el movimiento.")
+                self.navigator.cancelTask()
+                self.moving = False
+                return False
+            time.sleep(0.5)
+
+        self.get_logger().info("Movimiento completado.")
+        self.moving = False
+        return True
+
+    def start_search(self):
+        self.get_logger().info("Iniciando búsqueda de persona: rotación de 360° en pasos de 45°")
+        self.rotate_and_scan()
+
+        if self.searching:
+            self.get_logger().info("Persona no encontrada durante la rotación, iniciando movimientos aleatorios")
+            self.random_move_and_scan_loop()
+
+    def rotate_and_scan(self):
+        pose = self.get_robot_pose()
+        if not pose:
+            self.get_logger().error("Posición del robot desconocida, imposible rotar.")
+            self.searching = False
+            return
+
+        for angle_deg in range(0, 360, 45):
+            yaw = math.radians(angle_deg)
+            self.get_logger().info(f"Rotando a {angle_deg}°")
+            self.move_to(pose.x, pose.y, yaw)
+            time.sleep(1.5)  # detenerse y dejar estabilizar la cámara
+
+            if self.latest_image_msg:
+                self.image_callback(self.latest_image_msg)
+
+            if self.no_detection_frames == 0:
+                self.get_logger().info("Persona encontrada durante la exploración, deteniendo búsqueda.")
+                self.searching = False
+                return
+
+    def is_pose_navigable(self, x, y):
+        # Aquí podrías integrar un chequeo real con Nav2 o costmap para verificar si la posición es libre.
+        # Por ahora retorna True para simplificar.
+        return True
+
+    def random_move_and_scan_loop(self):
+        while self.searching:
+            pose = self.get_robot_pose()
+            if not pose:
+                self.get_logger().error("Posición del robot desconocida, deteniendo búsqueda.")
+                self.searching = False
+                return
+
+            for _ in range(10):  # intenta máximo 10 posiciones diferentes
+                angle = random.uniform(0, 2 * math.pi)
+                distance = random.uniform(2.0, 5.0)  # desplazamientos entre 2 y 5 metros
+                new_x = pose.x + math.cos(angle) * distance
+                new_y = pose.y + math.sin(angle) * distance
+
+                if self.is_pose_navigable(new_x, new_y):
+                    self.get_logger().info(f"Moviendo a posición navegable ({new_x:.2f}, {new_y:.2f})")
+                    if self.move_to(new_x, new_y):
+                        break
+                    else:
+                        self.get_logger().warn("Movimiento fallido, intentando otra posición.")
+            else:
+                self.get_logger().warn("No se encontraron posiciones navegables, deteniendo búsqueda.")
+                self.searching = False
+                return
+
+            self.rotate_and_scan()
+            if not self.searching:
+                return
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = PoseDetectionNode()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
