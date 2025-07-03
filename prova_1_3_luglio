@@ -1,0 +1,208 @@
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import Image
+from geometry_msgs.msg import PoseStamped, Quaternion, Twist
+from cv_bridge import CvBridge
+from ultralytics import YOLO
+import tf2_ros
+from transformations.transformations import quaternion_from_euler
+import math
+import time
+import random
+import numpy as np
+from nav2_simple_commander.robot_navigator import BasicNavigator
+
+class PoseDetectionNode(Node):
+    def __init__(self):
+        super().__init__('pose_detection_node')
+
+        self.navigator = BasicNavigator()
+        self.get_logger().info('Esperando a que Nav2 esté activo...')
+        self.navigator.waitUntilNav2Active()
+        self.get_logger().info('¡Nav2 está listo!')
+
+        self.subscription = self.create_subscription(
+            Image,
+            '/head_front_camera/rgb/image_raw',
+            self.image_callback,
+            10)
+
+        self.bridge = CvBridge()
+        self.model = YOLO('yolov8n-pose.pt')
+
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
+        self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+
+        self.moving = False
+        self.alert_sent = False
+        self.latest_image_msg = None
+
+        self.no_detection_frames = 0
+        self.no_detection_threshold = 5
+        self.searching = False
+        self.WHILE_DURATION = 0  # seconds
+
+    def image_callback(self, msg):
+        self.get_logger().info("CALLBACK FUNZIONA")
+        if self.moving:
+            return
+
+        self.latest_image_msg = msg
+        cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        results = self.model(cv_image)
+        if results[0].keypoints.has_visible == False:
+            self.no_detection_frames += 1
+            self.get_logger().info(f"No se detectó ninguna persona. Fotogramas consecutivos sin persona: {self.no_detection_frames}")
+            if self.no_detection_frames >= self.no_detection_threshold and not self.searching:
+                self.get_logger().warn("Persona perdida, iniciando búsqueda automática.")
+                self.searching = True
+                self.start_search()
+            return
+        else:
+            self.no_detection_frames = 0
+            if self.searching:
+                self.get_logger().info("Persona encontrada, deteniendo búsqueda.")
+            self.searching = False
+
+            keypoints = results[0].keypoints[0].cpu().numpy().data
+
+            head_indices = [0, 1, 2]
+            foot_indices = [15, 16]
+            head_visible = any(keypoints[0][i][2] > 0.3 for i in head_indices)
+            feet_visible = any(keypoints[0][i][2] > 0.3 for i in foot_indices)
+                
+            if head_visible and  feet_visible:
+                self.get_logger().info("Puntos clave de cabeza y pies visibles.")
+                self.searching = False
+
+            else:
+                self.get_logger().info("Puntos clave de cabeza o pies no suficientemente visibles.")
+                self.searching = True
+                self.start_search()
+                return
+
+            fallen = self.check_fall(keypoints)
+            self.get_logger().info(f"{fallen}")
+            if fallen:
+                self.alert_sent = True
+                self.get_logger().warn("¡Caída detectada! Enviando alerta.")
+                    # Inserta aquí notificaciones o acciones adicionales
+            elif not fallen and self.alert_sent:
+                self.alert_sent = False
+                self.get_logger().info("La persona se ha levantado, reseteando alerta.")
+
+    def check_fall(self, keypoints):
+        head_indices = [0, 1, 2]
+        foot_indices = [15, 16]
+
+        head_points = max(keypoints[0][i][1] for i in [0,1,2])
+        foot_points = max(keypoints[0][i][1] for i in [15,16])
+
+        if head_points == 0 or foot_points == 0:
+            return False
+
+        dist = np.linalg.norm(head_points - foot_points)
+        self.get_logger().info(f"dist: {dist}")
+        soglia_caduta = 110  # calibra según la resolución de la imagen
+        valore = dist < soglia_caduta
+        self.get_logger().info(f"valore: {valore}")
+        return valore
+
+    def get_robot_pose(self):
+        try:
+            now = rclpy.time.Time()
+            transform = self.tf_buffer.lookup_transform('map', 'base_link', now, timeout=rclpy.duration.Duration(seconds=1.0))
+            return transform.transform.translation
+        except Exception as e:
+            self.get_logger().warn(f"Error al recuperar transformación: {e}")
+            return None
+
+    def move_to(self, x, y, yaw=0.0):
+        """ goal = PoseStamped()
+        goal.header.frame_id = 'map'
+        goal.header.stamp = self.get_clock().now().to_msg()
+        goal.pose.position.x = float(x)
+        goal.pose.position.y = float(y)
+        
+        q = quaternion_from_euler(yaw, 0, 0)
+        #self.get_logger().info(f"q: {q}")
+        goal.pose.orientation = Quaternion(x=q[0], y=q[1], z=q[2], w=q[3])
+
+        self.moving = True
+        self.get_logger().info(f"Navegando a: {x:.2f}, {y:.2f} con yaw {yaw:.2f} rad")
+        self.navigator.goToPose(goal)
+ """
+        start_time = time.time()
+        while not self.navigator.isTaskComplete():
+            if time.time() - start_time > 30:
+                self.get_logger().error("Tiempo de espera agotado durante el movimiento.")
+                self.navigator.cancelTask()
+                self.moving = False
+                return False
+            time.sleep(0.)
+
+        self.get_logger().info("Movimiento completado.")
+        self.moving = False
+        return True
+
+    def start_search(self):
+        self.get_logger().info("Iniciando búsqueda de persona...")
+        self.rotate_in_place_and_scan_cmd_vel()
+
+        if self.searching:
+            goal_1 = PoseStamped()
+            goal_1.header.frame_id = 'map'
+            goal_1.header.stamp = self.get_clock().now().to_msg()
+            goal_1.pose.position.x = float(1.1380209922790527)
+            goal_1.pose.position.y = float(6.022534370422363)
+            q = quaternion_from_euler(0, 0, 0)
+            goal_1.pose.orientation = Quaternion(x=q[0], y=q[1], z=q[2], w=q[3])
+            self.navigator.goToPose(goal_1)
+            self.get_logger().error(f"{self.navigator.isTaskComplete()}")
+
+
+    def is_pose_navigable(self, x, y):
+        return True
+
+    def rotate_in_place_and_scan_cmd_vel(self):
+        self.get_logger().info("Rotazione in-place: 360° in step di 45° usando /cmd_vel")
+        angle_step_rad = math.radians(45)
+        angular_speed = 0.5  # rad/s
+        duration_per_step = angle_step_rad / angular_speed
+
+        
+        start_time = self.get_clock().now().nanoseconds
+        
+        while self.searching and self.WHILE_DURATION< 8 :   
+            self.get_logger().info(f"Step {self.WHILE_DURATION}/8: ruotando di 45° {self.searching}")
+
+            twist = Twist()
+            twist.angular.z = angular_speed
+            start_time = self.get_clock().now().nanoseconds
+
+            while (self.get_clock().now().nanoseconds - start_time) < (duration_per_step * 1e9):
+                self.cmd_vel_pub.publish(twist)
+                time.sleep(0.01)
+                
+
+            twist.angular.z = 0.0
+            self.cmd_vel_pub.publish(twist)
+
+            self.get_logger().info("Attesa 5 secondi per verifica...")
+            self.WHILE_DURATION+=1
+            self.searching=False
+            
+
+            
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = PoseDetectionNode()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
