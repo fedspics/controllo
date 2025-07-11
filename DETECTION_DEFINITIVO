@@ -1,0 +1,221 @@
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import Image, CameraInfo
+from geometry_msgs.msg import PoseStamped, Quaternion, Twist
+from cv_bridge import CvBridge
+from ultralytics import YOLO
+import tf2_ros
+from transformations.transformations import quaternion_from_euler
+import math
+import numpy as np
+from nav2_simple_commander.robot_navigator import BasicNavigator
+import message_filters
+import time
+
+class NodoDeteccionCaidas(Node):
+    def __init__(self):
+        super().__init__('nodo_deteccion_caidas')
+
+        self.navigator = BasicNavigator()
+        self.get_logger().info('Esperando a que Nav2 esté activo...')
+        self.navigator.waitUntilNav2Active()
+        self.get_logger().info('¡Nav2 está listo!')
+
+        self.bridge = CvBridge()
+        self.modelo = YOLO('yolov8n-pose.pt')
+
+        self.rgb_sub = message_filters.Subscriber(self, Image, '/head_front_camera/rgb/image_raw')
+        self.depth_sub = message_filters.Subscriber(self, Image, '/head_front_camera/depth/image_raw')
+        self.camera_info_sub = message_filters.Subscriber(self, CameraInfo, '/head_front_camera/depth/camera_info')
+
+        self.ts = message_filters.ApproximateTimeSynchronizer(
+            [self.rgb_sub, self.depth_sub, self.camera_info_sub], 10, 0.1)
+        self.ts.registerCallback(self.callback_sincronizado)
+
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
+        self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+
+        self.alerta_enviada = False
+        self.frames_sin_det = 0
+        self.umbral_frames_sin_det = 5
+        self.estado = 'inicial'
+
+        self.latest_rgb = None
+        self.latest_depth = None
+        self.latest_info = None
+
+    def callback_sincronizado(self, msg_rgb, msg_depth, msg_info_cam):
+        if self.estado in ['rotando', 'navegando']:
+            return
+
+        self.latest_rgb = msg_rgb
+        self.latest_depth = msg_depth
+        self.latest_info = msg_info_cam
+
+        self.analizar_imagen(msg_rgb, msg_depth, msg_info_cam)
+
+    def analizar_imagen(self, msg_rgb, msg_depth, msg_info_cam):
+        imagen_rgb = self.bridge.imgmsg_to_cv2(msg_rgb, desired_encoding='bgr8')
+        imagen_depth = self.bridge.imgmsg_to_cv2(msg_depth, desired_encoding='passthrough')
+        resultados = self.modelo(imagen_rgb)
+
+        if not resultados[0].keypoints.has_visible:
+            self.frames_sin_det += 1
+            self.get_logger().info(f"Ninguna persona detectada. Frames sin detección: {self.frames_sin_det}")
+            if self.frames_sin_det >= self.umbral_frames_sin_det and self.estado == 'inicial':
+                self.estado = 'rotando'
+                self.rotate_steps_cmdvel()
+            return
+
+        keypoints = resultados[0].keypoints[0].cpu().numpy().data
+        K = np.array(msg_info_cam.k).reshape(3, 3)
+
+        if not self.keypoints_visibles(keypoints):
+            self.get_logger().info("Persona detectada pero keypoints insuficientes. Iniciar navegación.")
+            self.frames_sin_det = 0
+            if self.estado == 'inicial':
+                self.estado = 'navegando'
+                self.ir_a_punto_busqueda()
+            return
+        else:
+            self.frames_sin_det = 0
+            if self.estado != 'inicial':
+                self.get_logger().info("Persona encontrada. Cancelando búsqueda.")
+                self.estado = 'inicial'
+
+        caida = self.comprobar_caida_3d(keypoints, imagen_depth, K)
+        self.get_logger().info(f"¿Caída detectada?: {caida}")
+
+        if caida and not self.alerta_enviada:
+            self.alerta_enviada = True
+            self.get_logger().warn("¡CAÍDA DETECTADA!")
+        elif not caida and self.alerta_enviada:
+            self.alerta_enviada = False
+            self.get_logger().info("Persona recuperada. Alerta reiniciada.")
+
+    def keypoints_visibles(self, keypoints):
+        indices_cabeza = [0, 1, 2]
+        indices_pies = [15, 16]
+        cabeza_visible = any(keypoints[0][i][2] > 0.5 for i in indices_cabeza)
+        pies_visible = any(keypoints[0][i][2] > 0.5 for i in indices_pies)
+        return cabeza_visible and pies_visible
+
+    def comprobar_caida_3d(self, keypoints, depth_img, K):
+        def pixel_a_3d(u, v, depth, K):
+            fx, fy = K[0, 0], K[1, 1]
+            cx, cy = K[0, 2], K[1, 2]
+            x = (u - cx) * depth / fx
+            y = (v - cy) * depth / fy
+            z = depth
+            return np.array([x, y, z])
+
+        indices_cabeza = [0, 1, 2]
+        indices_pies = [15, 16]
+        puntos_cabeza = []
+        puntos_pies = []
+
+        for i in indices_cabeza:
+            u, v, conf = keypoints[0][i]
+            if conf > 0.5:
+                u, v = int(u), int(v)
+                depth = depth_img[v, u]
+                if 0.1 < depth < 5.0:
+                    puntos_cabeza.append(pixel_a_3d(u, v, depth, K))
+
+        for i in indices_pies:
+            u, v, conf = keypoints[0][i]
+            if conf > 0.5:
+                u, v = int(u), int(v)
+                depth = depth_img[v, u]
+                if 0.1 < depth < 5.0:
+                    puntos_pies.append(pixel_a_3d(u, v, depth, K))
+
+        if not puntos_cabeza or not puntos_pies:
+            return False
+
+        cabeza_media = np.mean(puntos_cabeza, axis=0)
+        pies_medios = np.mean(puntos_pies, axis=0)
+
+        distancia_vertical = abs(cabeza_media[1] - pies_medios[1])
+        self.get_logger().info(f"Distancia vertical cabeza-pies: {distancia_vertical:.2f} m")
+
+        if distancia_vertical < 0.6:
+            altura_pies = pies_medios[1]
+            self.get_logger().info(f"Altura de los pies: {altura_pies:.2f} m")
+            if altura_pies > 0.4:
+                self.get_logger().warn("Pies demasiado altos. Posible persona en sofá.")
+                return False
+            return True
+
+        return False
+
+    def ir_a_punto_busqueda(self):
+        self.get_logger().info("Navegando hacia punto fijo de búsqueda...")
+        objetivo = PoseStamped()
+        objetivo.header.frame_id = 'odom'
+        objetivo.header.stamp = self.get_clock().now().to_msg()
+        objetivo.pose.position.x = -0.7
+        objetivo.pose.position.y = 0.90
+        q = quaternion_from_euler(0, 0, 0)
+        objetivo.pose.orientation = Quaternion(x=q[0], y=q[1], z=q[2], w=q[3])
+
+        self.navigator.goToPose(objetivo)
+
+        while not self.navigator.isTaskComplete():
+            rclpy.spin_once(self, timeout_sec=0.1)
+
+        self.get_logger().info("Llegada al punto completada.")
+        self.estado = 'rotando'
+        self.rotate_steps_cmdvel()
+
+    def rotate_steps_cmdvel(self):
+        pasos = 8
+        angular_speed = 0.5
+        duracion_step = 10.0
+
+        for i in range(pasos):
+            if self.estado != 'rotando':
+                self.get_logger().info("Rotación cancelada antes de completar pasos.")
+                break
+
+            self.get_logger().info(f"Paso {i+1}/{pasos}: rotando 45° con cmd_vel")
+            twist = Twist()
+            twist.angular.z = angular_speed
+            start_time = time.time()
+
+            while time.time() - start_time < duracion_step:
+                self.cmd_vel_pub.publish(twist)
+                rclpy.spin_once(self, timeout_sec=0.01)
+
+            twist.angular.z = 0.0
+            self.cmd_vel_pub.publish(twist)
+
+            self.get_logger().info("Pausa per stabilizzazione e attesa nuovo frame...")
+            ultimo_stamp = self.latest_rgb.header.stamp if self.latest_rgb else None
+            start_pause = time.time()
+            while time.time() - start_pause < 3.0:
+                rclpy.spin_once(self, timeout_sec=0.1)
+                if self.latest_rgb and self.latest_rgb.header.stamp != ultimo_stamp:
+                    break
+
+            if self.latest_rgb and self.latest_depth and self.latest_info:
+                self.analizar_imagen(self.latest_rgb, self.latest_depth, self.latest_info)
+                if self.estado == 'inicial':
+                    self.get_logger().info("Detección durante rotación. Cancelando búsqueda.")
+                    break
+
+        if self.estado == 'rotando':
+            self.estado = 'navegando'
+            self.ir_a_punto_busqueda()
+
+def main(args=None):
+    rclpy.init(args=args)
+    nodo = NodoDeteccionCaidas()
+    rclpy.spin(nodo)
+    nodo.destroy_node()
+    rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
