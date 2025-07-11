@@ -1,0 +1,70 @@
+#include <rclcpp/rclcpp.hpp>
+#include <moveit/move_group_interface/move_group_interface.h>
+#include <geometry_msgs/msg/point_stamped.hpp>
+#include <geometry_msgs/msg/pose.hpp>
+
+class MoveItManual
+{
+public:
+  MoveItManual(const rclcpp::Node::SharedPtr& node)
+  : node_(node)
+  {
+    RCLCPP_INFO(node_->get_logger(), "Initializing MoveGroupInterface");
+
+    move_group_ = std::make_shared<moveit::planning_interface::MoveGroupInterface>(node_, "arm_torso");
+
+    bowl_sub_ = node_->create_subscription<geometry_msgs::msg::PointStamped>(
+      "/bowl_position", 10,
+      std::bind(&MoveItManual::bowl_callback, this, std::placeholders::_1));
+
+    RCLCPP_INFO(node_->get_logger(), "Subscribed to /bowl_position");
+  }
+
+private:
+  void bowl_callback(const geometry_msgs::msg::PointStamped::SharedPtr msg)
+  {
+    RCLCPP_INFO(node_->get_logger(), "Received target point: x=%f, y=%f, z=%f",
+                msg->point.x, msg->point.y, msg->point.z);
+
+    geometry_msgs::msg::Pose target_pose;
+    target_pose.position = msg->point;
+
+    // Imposto un orientamento fisso (identity quaternion)
+    target_pose.orientation.x = 0.0;
+    target_pose.orientation.y = 0.0;
+    target_pose.orientation.z = 0.0;
+    target_pose.orientation.w = 1.0;
+
+    move_group_->setPoseTarget(target_pose);
+
+    moveit::planning_interface::MoveGroupInterface::Plan plan;
+    bool success = (move_group_->plan(plan) == moveit::core::MoveItErrorCode::SUCCESS);
+
+    if (success)
+    {
+      RCLCPP_INFO(node_->get_logger(), "Planning successful, executing the plan...");
+      move_group_->move();
+      RCLCPP_INFO(node_->get_logger(), "Motion complete.");
+    }
+    else
+    {
+      RCLCPP_ERROR(node_->get_logger(), "Planning failed.");
+    }
+  }
+
+  rclcpp::Node::SharedPtr node_;
+  std::shared_ptr<moveit::planning_interface::MoveGroupInterface> move_group_;
+  rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr bowl_sub_;
+};
+
+int main(int argc, char **argv)
+{
+  rclcpp::init(argc, argv);
+
+  auto node = rclcpp::Node::make_shared("moveit_manual_node");
+  auto moveit_manual = std::make_shared<MoveItManual>(node);
+
+  rclcpp::spin(node);
+  rclcpp::shutdown();
+  return 0;
+}
